@@ -1,0 +1,307 @@
+"""
+AI-Based-Energy-Consumption-Profiling
+File: AI-Based-Energy-Consumption-Profiling.py
+
+What this script does:
+- Generates synthetic household energy consumption data (hourly aggregated to daily and 24-hour profiles).
+- Performs feature engineering to create household-level features and daily load profiles.
+- Uses clustering (KMeans) to create consumption profiles (i.e., consumer segments).
+- Trains a RandomForest classifier to predict the profile label from household features.
+- Produces visualizations and exports results to CSV / Excel.
+
+Requirements:
+- Python 3.8+
+- pandas, numpy, scikit-learn, matplotlib, seaborn, openpyxl
+
+Run: python AI-Based-Energy-Consumption-Profiling.py
+"""
+
+import os
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set(style="whitegrid")
+np.random.seed(42)
+
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# -----------------------------
+# 1) Synthetic data generation
+# -----------------------------
+
+def generate_synthetic_households(num_households=500):
+    """
+    Generate synthetic household meta-data.
+    Returns a DataFrame with one row per household.
+    """
+    household_ids = [f"H{idx:04d}" for idx in range(1, num_households + 1)]
+    household_size = np.random.choice([1, 2, 3, 4, 5, 6], size=num_households, p=[0.15,0.25,0.25,0.2,0.1,0.05])
+    building_type = np.random.choice(["apartment", "detached", "semi-detached", "townhouse"], size=num_households, p=[0.35,0.35,0.15,0.15])
+    region = np.random.choice(["north","south","east","west","central"], size=num_households)
+    hvac_efficiency = np.round(np.random.uniform(0.6, 1.0, size=num_households), 2)  # 1.0 best
+    has_solar = np.random.choice([0,1], size=num_households, p=[0.85,0.15])
+    base_usage = np.round(np.random.uniform(3,8,size=num_households),2)  # kWh baseline per day
+
+    households = pd.DataFrame({
+        "household_id": household_ids,
+        "household_size": household_size,
+        "building_type": building_type,
+        "region": region,
+        "hvac_efficiency": hvac_efficiency,
+        "has_solar": has_solar,
+        "base_usage": base_usage
+    })
+    return households
+
+
+def generate_daily_profiles(households, days=365):
+    """
+    For each household, generate `days` days of hourly consumption (24 values per day).
+    We'll produce an aggregated daily consumption and also store the 24-hour profile.
+    Returns a DataFrame with columns: household_id, date, total_kwh, profile_0..profile_23
+    """
+    profiles = []
+    date_range = pd.date_range(end=pd.Timestamp.today().normalize(), periods=days)
+
+    for _, row in households.iterrows():
+        hid = row.household_id
+        size = row.household_size
+        base = row.base_usage
+        hvac_eff = row.hvac_efficiency
+        solar = row.has_solar
+
+        # Create a daily pattern template (morning peak, evening peak)
+        # Base profile shape (24 hours)
+        x = np.arange(24)
+        morning_peak = 0.6 * np.exp(-0.5 * ((x - 7) / 2)**2)
+        evening_peak = 1.0 * np.exp(-0.5 * ((x - 19) / 2.5)**2)
+        night_usage = 0.2 * np.exp(-0.5 * ((x - 2) / 3)**2)
+        workday_modifier = 1.0
+
+        for d, date in enumerate(date_range):
+            # Seasonal effect: simple sinusoidal over the year to simulate heating/cooling
+            seasonality = 1.0 + 0.25 * np.sin(2 * np.pi * (d / days))
+            # weekday/weekend modifier
+            weekday = date.weekday() < 5
+            wd_factor = 1.0 if weekday else 0.9
+
+            # temperature-driven HVAC effect (simulate hotter/cooler days randomly)
+            temp_factor = 1.0 + np.random.normal(0, 0.05)
+
+            # random daily variation
+            noise = np.random.normal(1.0, 0.08, size=24)
+
+            profile = (0.5 * morning_peak + 0.9 * evening_peak + night_usage) * (base * size / 3.0)
+            profile = profile * seasonality * wd_factor * temp_factor * noise
+
+            # solar generation subtracts from daytime usage
+            if solar:
+                solar_generation = np.maximum(0, 0.6 * np.exp(-0.5*((x-13)/3)**2))  # midday generation shape
+                # solar reduces consumption between 8 and 16
+                profile = profile - 0.7 * solar_generation * base
+                profile = np.clip(profile, a_min=0.05, a_max=None)
+
+            total_kwh = profile.sum()
+            day_record = {
+                "household_id": hid,
+                "date": date,
+                "total_kwh": total_kwh,
+                "weekday": int(weekday)
+            }
+            # attach hourly columns
+            for h in range(24):
+                day_record[f"h_{h}"] = profile[h]
+
+            profiles.append(day_record)
+
+    profiles_df = pd.DataFrame(profiles)
+    return profiles_df
+
+# -----------------------------
+# 2) Create dataset
+# -----------------------------
+
+print("Generating synthetic households...")
+households = generate_synthetic_households(num_households=200)
+print("Generating daily profiles (this may take a moment)...")
+daily = generate_daily_profiles(households, days=365)
+
+# Merge household meta into daily
+data = daily.merge(households, on="household_id", how="left")
+
+# -----------------------------
+# 3) Feature engineering
+# -----------------------------
+print("Feature engineering...")
+
+# Daily features
+data['hourly_profile'] = data[[f"h_{h}" for h in range(24)]].values.tolist()
+
+# Calculate simple statistics from 24-hour profile
+data['peak_kwh'] = data[[f"h_{h}" for h in range(24)]].max(axis=1)
+data['offpeak_kwh'] = data[[f"h_{h}" for h in range(24)]].min(axis=1)
+data['mean_hourly_kwh'] = data[[f"h_{h}" for h in range(24)]].mean(axis=1)
+
+data['evening_share'] = data[[f"h_{h}" for h in range(17,23)]].sum(axis=1) / data['total_kwh']
+
+data['morning_share'] = data[[f"h_{h}" for h in range(5,10)]].sum(axis=1) / data['total_kwh']
+
+# Household-level aggregates: average daily consumption and variability
+agg = data.groupby('household_id').agg(
+    avg_daily_kwh=('total_kwh','mean'),
+    std_daily_kwh=('total_kwh','std'),
+    median_daily_kwh=('total_kwh','median')
+).reset_index()
+
+household_features = households.merge(agg, on='household_id', how='left')
+
+# For clustering, we'll use normalized 24-hour profiles averaged per household
+profile_cols = [f"h_{h}" for h in range(24)]
+avg_profile = data.groupby('household_id')[profile_cols].mean().reset_index()
+avg_profile = avg_profile.merge(household_features, on='household_id', how='left')
+
+# Normalize profiles
+scaler = StandardScaler()
+profile_matrix = scaler.fit_transform(avg_profile[profile_cols].values)
+
+# -----------------------------
+# 4) Clustering to create profiles
+# -----------------------------
+print("Clustering to create consumption profiles...")
+
+n_clusters = 4
+kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+profile_labels = kmeans.fit_predict(profile_matrix)
+avg_profile['profile_label'] = profile_labels
+
+# Add label to household_features
+household_features = household_features.merge(avg_profile[['household_id','profile_label']], on='household_id', how='left')
+
+# Save cluster centers (for interpretation)
+cluster_centers = scaler.inverse_transform(kmeans.cluster_centers_)
+cluster_centers_df = pd.DataFrame(cluster_centers, columns=profile_cols)
+cluster_centers_df['profile'] = [f"Profile_{i}" for i in range(n_clusters)]
+cluster_centers_df.to_csv(os.path.join(OUTPUT_DIR, 'cluster_centers.csv'), index=False)
+
+# -----------------------------
+# 5) Train classifier to predict profile from household features
+# -----------------------------
+print("Training classifier to predict profile labels from household features...")
+
+# Prepare features
+cat_cols = ['building_type','region','has_solar']
+clf_df = household_features.copy()
+clf_df = pd.get_dummies(clf_df, columns=['building_type','region'], drop_first=True)
+
+feature_cols = ['household_size','hvac_efficiency','has_solar','avg_daily_kwh','std_daily_kwh','median_daily_kwh'] + \
+               [c for c in clf_df.columns if c.startswith('building_type_') or c.startswith('region_')]
+
+X = clf_df[feature_cols].fillna(0)
+y = clf_df['profile_label']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
+
+clf = RandomForestClassifier(n_estimators=200, random_state=42)
+clf.fit(X_train, y_train)
+
+y_pred = clf.predict(X_test)
+
+report = classification_report(y_test, y_pred, zero_division=0)
+cm = confusion_matrix(y_test, y_pred)
+
+with open(os.path.join(OUTPUT_DIR, 'classification_report.txt'), 'w') as f:
+    f.write(report)
+
+# -----------------------------
+# 6) Visualizations
+# -----------------------------
+print("Generating visualizations...")
+
+# PCA of profiles colored by cluster
+pca = PCA(n_components=2)
+proj = pca.fit_transform(profile_matrix)
+proj_df = pd.DataFrame(proj, columns=['pc1','pc2'])
+proj_df['profile_label'] = profile_labels
+proj_df['household_id'] = avg_profile['household_id'].values
+
+plt.figure(figsize=(8,6))
+for lbl in sorted(proj_df['profile_label'].unique()):
+    subset = proj_df[proj_df['profile_label']==lbl]
+    plt.scatter(subset['pc1'], subset['pc2'], label=f'Profile {lbl}', alpha=0.6)
+plt.legend()
+plt.title('PCA of average daily profiles by cluster')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR,'profiles_pca.png'), dpi=150)
+plt.close()
+
+# Plot cluster center load shapes
+plt.figure(figsize=(10,6))
+for i in range(n_clusters):
+    plt.plot(range(24), cluster_centers_df.loc[i, profile_cols].values, marker='o', label=f'Profile_{i}')
+plt.xlabel('Hour of day')
+plt.ylabel('kWh')
+plt.title('Cluster center daily load shapes')
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR,'cluster_centers.png'), dpi=150)
+plt.close()
+
+# Confusion matrix heatmap
+plt.figure(figsize=(6,5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+plt.title('Confusion Matrix (profile prediction)')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR,'confusion_matrix.png'), dpi=150)
+plt.close()
+
+# -----------------------------
+# 7) Feature importance
+# -----------------------------
+feat_imp = pd.Series(clf.feature_importances_, index=X.columns).sort_values(ascending=False)
+feat_imp.to_csv(os.path.join(OUTPUT_DIR,'feature_importances.csv'))
+
+plt.figure(figsize=(8,6))
+feat_imp.head(15).plot(kind='bar')
+plt.title('Top feature importances for profile prediction')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR,'feature_importances.png'), dpi=150)
+plt.close()
+
+# -----------------------------
+# 8) Save outputs (CSV / Excel)
+# -----------------------------
+print("Saving outputs to the output/ folder...")
+
+# household features with labels
+household_features.to_csv(os.path.join(OUTPUT_DIR,'household_features_with_profiles.csv'), index=False)
+# example daily data sample
+data.sample(500, random_state=42).to_csv(os.path.join(OUTPUT_DIR,'daily_sample.csv'), index=False)
+
+# Save to Excel workbook with multiple sheets
+with pd.ExcelWriter(os.path.join(OUTPUT_DIR,'energy_profiling_results.xlsx'), engine='openpyxl') as writer:
+    household_features.to_excel(writer, sheet_name='household_profiles', index=False)
+    cluster_centers_df.to_excel(writer, sheet_name='cluster_centers', index=False)
+    feat_imp.to_frame('importance').to_excel(writer, sheet_name='feature_importances')
+
+# Also print summary to console
+print("--- Summary ---")
+print(f"Number of households: {households.shape[0]}")
+print(f"Number of days per household: 365")
+print(f"Cluster counts:\n{avg_profile['profile_label'].value_counts().sort_index()}\n")
+print("Classification report (saved to output/classification_report.txt):")
+print(report)
+
+print("All done. Results are in the 'output' folder.")
